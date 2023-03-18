@@ -3,6 +3,7 @@
 #include "fastswap_rdma.h"
 #include <linux/slab.h>
 #include <linux/cpumask.h>
+#include <linux/atomic.h>
 
 static struct sswap_rdma_ctrl *gctrl;
 static int serverport;
@@ -15,6 +16,11 @@ module_param_named(sport, serverport, int, 0644);
 module_param_named(nq, numqueues, int, 0644);
 module_param_string(sip, serverip, INET_ADDRSTRLEN, 0644);
 module_param_string(cip, clientip, INET_ADDRSTRLEN, 0644);
+
+static atomic_t total_reads;
+static atomic_t total_writes;
+static atomic_long_t total_time_read;
+static atomic_long_t total_time_write;
 
 // TODO: destroy ctrl
 
@@ -420,6 +426,11 @@ static int sswap_rdma_create_ctrl(struct sswap_rdma_ctrl **c)
 
 static void __exit sswap_rdma_cleanup_module(void)
 {
+  pr_info("Total reads = %d\n", atomic_read(&total_reads));
+  pr_info("Total writes = %d\n", atomic_read(&total_writes));
+  pr_info("Total read time = %lu\n", atomic_long_read(&total_time_read));
+  pr_info("Total write time = %lu\n", atomic_long_read(&total_time_write));
+
   sswap_rdma_stopandfree_queues(gctrl);
   ib_unregister_client(&sswap_rdma_ib_client);
   kfree(gctrl);
@@ -431,10 +442,20 @@ static void __exit sswap_rdma_cleanup_module(void)
 
 static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
 {
+  struct timespec end;
+  getrawmonotonic(&end);
+  atomic_inc(&total_writes);
+
   struct rdma_req *req =
     container_of(wc->wr_cqe, struct rdma_req, cqe);
   struct rdma_queue *q = cq->cq_context;
   struct ib_device *ibdev = q->ctrl->rdev->dev;
+
+  long duration = ((end.tv_sec - req->start.tv_sec) * 1000000000L) + (end.tv_nsec - req->start.tv_nsec);
+  if(duration < 0) {
+    pr_err("ERROR! duration is < 0: %ld\n", duration);
+  }
+  atomic_long_add(duration, &total_time_write);
 
   if (unlikely(wc->status != IB_WC_SUCCESS)) {
     pr_err("sswap_rdma_write_done status is not success, it is=%d\n", wc->status);
@@ -448,10 +469,20 @@ static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
 
 static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
 {
+  struct timespec end;
+  getrawmonotonic(&end);
+  atomic_inc(&total_reads);
+
   struct rdma_req *req =
     container_of(wc->wr_cqe, struct rdma_req, cqe);
   struct rdma_queue *q = cq->cq_context;
   struct ib_device *ibdev = q->ctrl->rdev->dev;
+
+  long duration = ((end.tv_sec - req->start.tv_sec) * 1000000000L) + (end.tv_nsec - req->start.tv_nsec);
+  if(duration < 0) {
+    pr_err("ERROR! duration is < 0: %ld\n", duration);
+  }
+  atomic_long_add(duration, &total_time_read);
 
   if (unlikely(wc->status != IB_WC_SUCCESS))
     pr_err("sswap_rdma_read_done status is not success, it is=%d\n", wc->status);
@@ -490,6 +521,7 @@ inline static int sswap_rdma_post_rdma(struct rdma_queue *q, struct rdma_req *qe
   rdma_wr.rkey = q->ctrl->servermr.key;
 
   atomic_inc(&q->pending);
+  getrawmonotonic(&(qe->start));
   ret = ib_post_send(q->qp, &rdma_wr.wr, bad_wr);
   if (unlikely(ret)) {
     pr_err("ib_post_send failed: %d\n", ret);
@@ -816,6 +848,9 @@ static int __init sswap_rdma_init_module(void)
 
   pr_info("start: %s\n", __FUNCTION__);
   pr_info("* RDMA BACKEND *");
+
+  atomic_long_set(&total_time_read, 0);
+  atomic_long_set(&total_time_write, 0);
 
   numcpus = num_online_cpus();
   numqueues = numcpus * 3;

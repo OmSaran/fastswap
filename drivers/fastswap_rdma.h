@@ -10,6 +10,7 @@
 #include <linux/gfp.h>
 #include <linux/pagemap.h>
 #include <linux/spinlock.h>
+#include <linux/time.h>
 
 enum qp_type {
   QP_READ_SYNC,
@@ -28,6 +29,7 @@ struct rdma_req {
   struct ib_cqe cqe;
   u64 dma;
   struct page *page;
+  struct timespec start;
 };
 
 struct sswap_rdma_ctrl;
