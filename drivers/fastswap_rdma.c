@@ -830,6 +830,8 @@ inline struct rdma_queue *sswap_rdma_get_queue(unsigned int cpuid,
 {
   BUG_ON(gctrl == NULL);
 
+  cpuid = cpuid/2;
+
   switch (type) {
     case QP_READ_SYNC:
       return &gctrl->queues[cpuid];
@@ -852,7 +854,7 @@ static int __init sswap_rdma_init_module(void)
   atomic_long_set(&total_time_read, 0);
   atomic_long_set(&total_time_write, 0);
 
-  numcpus = num_online_cpus();
+  numcpus = 128;
   numqueues = numcpus * 3;
   pr_info("numqueues = %d\n", numqueues);
 
