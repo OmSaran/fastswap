@@ -685,7 +685,7 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
     pr_info_ratelimited("back pressure happened on reads");
   }
 
-  ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
+  ret = get_req_for_page(&req, dev, page, DMA_FROM_DEVICE);
   if (unlikely(ret))
     return ret;
 
@@ -798,6 +798,8 @@ inline struct rdma_queue *sswap_rdma_get_queue(unsigned int cpuid,
 {
   BUG_ON(gctrl == NULL);
 
+  cpuid = cpuid/32;
+
   switch (type) {
     case QP_READ_SYNC:
       return &gctrl->queues[cpuid];
@@ -817,7 +819,8 @@ static int __init sswap_rdma_init_module(void)
   pr_info("start: %s\n", __FUNCTION__);
   pr_info("* RDMA BACKEND *");
 
-  numcpus = num_online_cpus();
+  // numcpus = num_online_cpus();
+  numcpus = 8;
   numqueues = numcpus * 3;
   pr_info("numqueues = %d\n", numqueues);
 
