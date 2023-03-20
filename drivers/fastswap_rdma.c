@@ -596,7 +596,7 @@ static int sswap_rdma_post_recv(struct rdma_queue *q, struct rdma_req *qe,
  * Don't touch the page with cpu after creating the request for it!
  * Deallocates the request if there was an error */
 inline static int get_req_for_page(struct rdma_req **req, struct ib_device *dev,
-				struct page *page, enum dma_data_direction dir)
+				struct page *page, enum dma_data_direction dir, int read)
 {
   int ret;
   struct timespec dma_start, dma_end;
@@ -623,7 +623,7 @@ inline static int get_req_for_page(struct rdma_req **req, struct ib_device *dev,
   }
   getrawmonotonic(&dma_end);
   duration = ((dma_end.tv_sec - dma_start.tv_sec) * 1000000000L) + (dma_end.tv_nsec - dma_start.tv_nsec);
-  if(dir == DMA_FROM_DEVICE) {
+  if(read) {
     atomic_long_add(duration, &total_dma_map_read);
   } else {
     atomic_long_add(duration, &total_dma_map_write);
@@ -718,7 +718,7 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
     pr_info_ratelimited("back pressure writes");
   }
 
-  ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
+  ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE, 0);
   if (unlikely(ret))
     return ret;
 
@@ -744,7 +744,7 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
     pr_info_ratelimited("back pressure happened on reads");
   }
 
-  ret = get_req_for_page(&req, dev, page, DMA_FROM_DEVICE);
+  ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE, 1);
   if (unlikely(ret))
     return ret;
 
