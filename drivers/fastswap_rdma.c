@@ -21,6 +21,10 @@ static atomic_t total_reads;
 static atomic_t total_writes;
 static atomic_long_t total_time_read;
 static atomic_long_t total_time_write;
+static atomic_long_t total_dma_unmap_write;
+static atomic_long_t total_dma_unmap_read;
+static atomic_long_t total_dma_map_read;
+static atomic_long_t total_dma_map_write;
 
 // TODO: destroy ctrl
 
@@ -429,6 +433,10 @@ static void __exit sswap_rdma_cleanup_module(void)
   pr_info("Total writes = %d\n", atomic_read(&total_writes));
   pr_info("Total read time = %lu\n", atomic_long_read(&total_time_read));
   pr_info("Total write time = %lu\n", atomic_long_read(&total_time_write));
+  pr_info("Total dma unmap write = %lu\n", atomic_long_read(&total_dma_unmap_write));
+  pr_info("Total dma unmap read = %lu\n", atomic_long_read(&total_dma_unmap_read));
+  pr_info("Total dma map read = %lu\n", atomic_long_read(&total_dma_map_read));
+  pr_info("Total dma map write = %lu\n", atomic_long_read(&total_dma_map_write));
 
   sswap_rdma_stopandfree_queues(gctrl);
   ib_unregister_client(&sswap_rdma_ib_client);
@@ -441,7 +449,7 @@ static void __exit sswap_rdma_cleanup_module(void)
 
 static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
 {
-  struct timespec end;
+  struct timespec end, dma_start, dma_end;
   getrawmonotonic(&end);
   atomic_inc(&total_writes);
 
@@ -460,7 +468,12 @@ static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
     pr_err("sswap_rdma_write_done status is not success, it is=%d\n", wc->status);
     //q->write_error = wc->status;
   }
+  getrawmonotonic(&dma_start);
   ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_TO_DEVICE);
+  getrawmonotonic(&dma_end);
+
+  duration = ((dma_end.tv_sec - dma_start.tv_sec) * 1000000000L) + (dma_end.tv_nsec - dma_start.tv_nsec);
+  atomic_long_add(duration, &total_dma_unmap_write);
 
   atomic_dec(&q->pending);
   kmem_cache_free(req_cache, req);
@@ -468,7 +481,7 @@ static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
 
 static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
 {
-  struct timespec end;
+  struct timespec end, dma_start, dma_end;
   getrawmonotonic(&end);
   atomic_inc(&total_reads);
 
@@ -486,7 +499,12 @@ static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
   if (unlikely(wc->status != IB_WC_SUCCESS))
     pr_err("sswap_rdma_read_done status is not success, it is=%d\n", wc->status);
 
+  getrawmonotonic(&dma_start);
   ib_dma_unmap_page(ibdev, req->dma, PAGE_SIZE, DMA_FROM_DEVICE);
+  getrawmonotonic(&dma_end);
+
+  duration = ((dma_end.tv_sec - dma_start.tv_sec) * 1000000000L) + (dma_end.tv_nsec - dma_start.tv_nsec);
+  atomic_long_add(duration, &total_dma_unmap_read);
 
   SetPageUptodate(req->page);
   unlock_page(req->page);
@@ -520,6 +538,7 @@ inline static int sswap_rdma_post_rdma(struct rdma_queue *q, struct rdma_req *qe
   rdma_wr.rkey = q->ctrl->servermr.key;
 
   atomic_inc(&q->pending);
+  getrawmonotonic(&(qe->start));
   ret = ib_post_send(q->qp, &rdma_wr.wr, &bad_wr);
   if (unlikely(ret)) {
     pr_err("ib_post_send failed: %d\n", ret);
@@ -580,6 +599,8 @@ inline static int get_req_for_page(struct rdma_req **req, struct ib_device *dev,
 				struct page *page, enum dma_data_direction dir)
 {
   int ret;
+  struct timespec dma_start, dma_end;
+  long duration;
 
   ret = 0;
   *req = kmem_cache_alloc(req_cache, GFP_ATOMIC);
@@ -592,12 +613,20 @@ inline static int get_req_for_page(struct rdma_req **req, struct ib_device *dev,
   (*req)->page = page;
   init_completion(&(*req)->done);
 
+  getrawmonotonic(&dma_start);
   (*req)->dma = ib_dma_map_page(dev, page, 0, PAGE_SIZE, dir);
   if (unlikely(ib_dma_mapping_error(dev, (*req)->dma))) {
     pr_err("ib_dma_mapping_error\n");
     ret = -ENOMEM;
     kmem_cache_free(req_cache, req);
     goto out;
+  }
+  getrawmonotonic(&dma_end);
+  duration = ((dma_end.tv_sec - dma_start.tv_sec) * 1000000000L) + (dma_end.tv_nsec - dma_start.tv_nsec);
+  if(dir == DMA_FROM_DEVICE) {
+    atomic_long_add(duration, &total_dma_map_read);
+  } else {
+    atomic_long_add(duration, &total_dma_map_write);
   }
 
   ib_dma_sync_single_for_device(dev, (*req)->dma, PAGE_SIZE, dir);
@@ -689,7 +718,6 @@ static inline int write_queue_add(struct rdma_queue *q, struct page *page,
     pr_info_ratelimited("back pressure writes");
   }
 
-  getrawmonotonic(&(qe->start));
   ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
   if (unlikely(ret))
     return ret;
@@ -716,7 +744,7 @@ static inline int begin_read(struct rdma_queue *q, struct page *page,
     pr_info_ratelimited("back pressure happened on reads");
   }
 
-  ret = get_req_for_page(&req, dev, page, DMA_TO_DEVICE);
+  ret = get_req_for_page(&req, dev, page, DMA_FROM_DEVICE);
   if (unlikely(ret))
     return ret;
 
@@ -850,6 +878,12 @@ static int __init sswap_rdma_init_module(void)
 
   atomic_long_set(&total_time_read, 0);
   atomic_long_set(&total_time_write, 0);
+  atomic_set(&total_writes, 0);
+  atomic_set(&total_reads, 0);
+  atomic_long_set(&total_dma_unmap_write, 0);
+  atomic_long_set(&total_dma_unmap_read, 0);
+  atomic_long_set(&total_dma_map_read, 0);
+  atomic_long_set(&total_dma_map_write, 0);
 
   numcpus = num_online_cpus();
   numqueues = numcpus * 3;
