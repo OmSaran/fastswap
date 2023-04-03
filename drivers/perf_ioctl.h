@@ -17,6 +17,8 @@ struct perf_args {
 #define TEST _IO(FASTSWAP_MAGIC, 0x0)
 #define START _IO(FASTSWAP_MAGIC, 0x1)
 #define STOP _IOWR(FASTSWAP_MAGIC, 0x2, struct perf_args)
+#define START_WRITES _IO(FASTSWAP_MAGIC, 0x3)
+#define STOP_WRITES _IOWR(FASTSWAP_MAGIC, 0x4, struct perf_args)
 
 
 struct perf_args_rdma {

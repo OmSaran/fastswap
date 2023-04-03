@@ -38,10 +38,13 @@ static struct cdev cdev;
 static struct class *dev_class;
 
 static atomic_long_t total_time_reads_sync;
+static atomic_long_t total_time_writes;
 static atomic_long_t total_time_reads_async;
 static atomic_long_t total_num_reads_async;
 static atomic_long_t total_num_reads_sync;
+static atomic_long_t total_num_writes;
 static bool measure = false;
+static bool measure_write = false;
 
 static struct file_operations fops = {
     .owner = THIS_MODULE,
@@ -51,9 +54,19 @@ static struct file_operations fops = {
 static int sswap_store(unsigned type, pgoff_t pageid,
         struct page *page)
 {
+  struct timespec start, end;
+  if(measure_write) {
+    getrawmonotonic(&start);
+  }
   if (sswap_rdma_write(page, pageid << PAGE_SHIFT)) {
     pr_err("could not store page remotely\n");
     return -1;
+  }
+  if(measure_write) {
+    getrawmonotonic(&end);
+    long duration = ((end.tv_sec - start.tv_sec) * 1000000000L) + (end.tv_nsec - start.tv_nsec);
+    atomic_long_add(duration, &total_time_writes);
+    atomic_long_add(1L, &total_num_writes);
   }
 
   return 0;
@@ -91,6 +104,7 @@ static int sswap_load(unsigned type, pgoff_t pageid, struct page *page)
 {
   struct timespec start, end;
   if(measure) {
+    sswap_store(0, pageid, page);
     getrawmonotonic(&start);
   }
   if (unlikely(sswap_rdma_read_sync(page, pageid << PAGE_SHIFT))) {
@@ -159,6 +173,24 @@ static void handle_start(void) {
   atomic_long_set(&total_time_reads_sync, 0L);
 }
 
+static void handle_start_writes(void) {
+  atomic_long_set(&total_num_writes, 0L);
+  atomic_long_set(&total_time_writes, 0L);
+  measure_write = true;
+}
+
+static int handle_stop_writes(struct perf_args *perf) {
+  measure_write = false;
+  perf->count_sync = atomic_long_read(&total_num_writes);
+  perf->count_async = 0;
+  perf->total_time_sync = atomic_long_read(&total_time_writes);
+  perf->total_time_async = 0;
+
+  atomic_long_set(&total_num_writes, 0L);
+  atomic_long_set(&total_time_writes, 0L);
+  return 0;
+}
+
 static int handle_stop(struct perf_args *perf) {
   measure = false;
   perf->count_sync = atomic_long_read(&total_num_reads_sync);
@@ -186,6 +218,17 @@ static long perf_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
     case STOP:
         copy_from_user((void *)&perf, (const void *)arg, sizeof(perf));
         if(unlikely(handle_stop(&perf))) {
+            pr_err("ioctl: failed to read remote mr\n");
+            return -EINVAL;
+        }
+        copy_to_user((void *)arg, (const void*)&perf, sizeof(perf));
+        break;
+    case START_WRITES:
+        handle_start_writes();
+        break;
+    case STOP_WRITES:
+        copy_from_user((void *)&perf, (const void *)arg, sizeof(perf));
+        if(unlikely(handle_stop_writes(&perf))) {
             pr_err("ioctl: failed to read remote mr\n");
             return -EINVAL;
         }
@@ -244,6 +287,8 @@ static int __init init_sswap(void)
   atomic_long_set(&total_num_reads_sync, 0L);
   atomic_long_set(&total_time_reads_sync, 0L);
   atomic_long_set(&total_time_reads_async, 0L);
+  atomic_long_set(&total_time_writes, 0L);
+  atomic_long_set(&total_num_writes, 0L);
   frontswap_register_ops(&sswap_frontswap_ops);
   if (sswap_init_debugfs())
     pr_err("sswap debugfs failed\n");

@@ -868,7 +868,7 @@ static int handle_stop(struct perf_args *perf) {
   perf->total_time_sync = atomic_long_read(&total_time_ops);
   perf->total_time_async = atomic_long_read(&total_time_reads_async);
 
-  atomic_long_set(&total_num_reads_async, 0L);
+  atomic_long_set(&total_num_reads_sync, 0L);
   atomic_long_set(&total_time_ops, 0L);
   atomic_long_set(&total_time_reads_async, 0L);
   atomic_long_set(&total_time_ops, 0L);
