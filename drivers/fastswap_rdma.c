@@ -3,6 +3,20 @@
 #include "fastswap_rdma.h"
 #include <linux/slab.h>
 #include <linux/cpumask.h>
+#include <linux/cdev.h>
+
+#include "perf_ioctl.h"
+
+dev_t dev_rdma = 0;
+static struct cdev cdev;
+static struct class *dev_class;
+
+static atomic_long_t total_time_ops;
+static atomic_long_t total_time_reads_async;
+static atomic_long_t total_num_reads_async;
+static atomic_long_t total_num_ops;
+static bool measure = false;
+
 
 static struct sswap_rdma_ctrl *gctrl;
 static int serverport;
@@ -15,6 +29,8 @@ module_param_named(sport, serverport, int, 0644);
 module_param_named(nq, numqueues, int, 0644);
 module_param_string(sip, serverip, INET_ADDRSTRLEN, 0644);
 module_param_string(cip, clientip, INET_ADDRSTRLEN, 0644);
+
+static long perf_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
 
 // TODO: destroy ctrl
 
@@ -426,6 +442,12 @@ static void __exit sswap_rdma_cleanup_module(void)
   if (req_cache) {
     kmem_cache_destroy(req_cache);
   }
+
+  device_destroy(dev_class, dev_rdma);
+  class_destroy(dev_class);
+  cdev_del(&cdev);
+  unregister_chrdev_region(dev_rdma, 1);
+  pr_info("Character device successfully uninstalled\n");
 }
 
 static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
@@ -447,10 +469,21 @@ static void sswap_rdma_write_done(struct ib_cq *cq, struct ib_wc *wc)
 
 static void sswap_rdma_read_done(struct ib_cq *cq, struct ib_wc *wc)
 {
+  struct timespec end;
+  if(measure) {
+    getrawmonotonic(&end);
+  }
+
   struct rdma_req *req =
     container_of(wc->wr_cqe, struct rdma_req, cqe);
   struct rdma_queue *q = cq->cq_context;
   struct ib_device *ibdev = q->ctrl->rdev->dev;
+
+  if(measure) {
+    long duration = ((end.tv_sec - req->rtt_start.tv_sec) * 1000000000L) + (end.tv_nsec - req->rtt_start.tv_nsec);
+    atomic_long_add(duration, &total_time_ops);
+    atomic_long_add(1L, &total_num_ops);
+  }
 
   if (unlikely(wc->status != IB_WC_SUCCESS))
     pr_err("sswap_rdma_read_done status is not success, it is=%d\n", wc->status);
@@ -489,6 +522,8 @@ inline static int sswap_rdma_post_rdma(struct rdma_queue *q, struct rdma_req *qe
   rdma_wr.rkey = q->ctrl->servermr.key;
 
   atomic_inc(&q->pending);
+  if(measure)
+    getrawmonotonic(&(qe->rtt_start));
   ret = ib_post_send(q->qp, &rdma_wr.wr, &bad_wr);
   if (unlikely(ret)) {
     pr_err("ib_post_send failed: %d\n", ret);
@@ -809,6 +844,108 @@ inline struct rdma_queue *sswap_rdma_get_queue(unsigned int cpuid,
   };
 }
 
+static struct file_operations fops = {
+    .owner = THIS_MODULE,
+    .unlocked_ioctl = perf_ioctl,
+};
+
+static void handle_test(void) {
+  pr_info("Test ioctl fastswap rdma\n");
+}
+
+static void handle_start(void) {
+  measure = true;
+  atomic_long_set(&total_num_reads_async, 0L);
+  atomic_long_set(&total_time_ops, 0L);
+  atomic_long_set(&total_time_reads_async, 0L);
+  atomic_long_set(&total_time_ops, 0L);
+}
+
+static int handle_stop(struct perf_args *perf) {
+  measure = false;
+  perf->count_sync = atomic_long_read(&total_num_ops);
+  perf->count_async = atomic_long_read(&total_num_reads_async);
+  perf->total_time_sync = atomic_long_read(&total_time_ops);
+  perf->total_time_async = atomic_long_read(&total_time_reads_async);
+
+  atomic_long_set(&total_num_reads_async, 0L);
+  atomic_long_set(&total_time_ops, 0L);
+  atomic_long_set(&total_time_reads_async, 0L);
+  atomic_long_set(&total_time_ops, 0L);
+
+  return 0;
+}
+
+static long perf_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    struct perf_args perf;
+    switch(cmd) {
+    case TEST_RDMA:
+        handle_test();
+        break;
+    case START_RDMA:
+        handle_start();
+        break;
+    case STOP_RDMA:
+        copy_from_user((void *)&perf, (const void *)arg, sizeof(perf));
+        if(unlikely(handle_stop(&perf))) {
+            pr_err("ioctl: failed to read remote mr\n");
+            return -EINVAL;
+        }
+        copy_to_user((void *)arg, (const void*)&perf, sizeof(perf));
+        break;
+    default:
+        pr_err("Unkown ioctl cmd: %u\n", cmd);
+    }
+
+    return 0;
+}
+
+static int __init perf_ioctl_init(void) {
+    // Ask for device major/minor number
+    if((alloc_chrdev_region(&dev_rdma, 0, 1, "fastswap_perf_rdma")) <0){
+        pr_err("Cannot allocate major number\n");
+        return -1;
+    }
+    pr_info("Major = %d Minor = %d \n", MAJOR(dev_rdma), MINOR(dev_rdma));
+
+    // Initialize cdev struct and associate it with fops
+    cdev_init(&cdev, &fops);
+
+    /* Add to system */
+    if((cdev_add(&cdev, dev_rdma, 1)) < 0){
+        pr_err("Failed to add to the system\n");
+        goto remove_device_region;
+    }
+
+    /* create /sys/class */
+    if(IS_ERR(dev_class = class_create(THIS_MODULE, "fastswap_perf_rdma_class"))){
+        pr_err("Cannot create class\n");
+        goto remove_device_region;
+    }
+
+    /* create /dev */
+    if(IS_ERR(device_create(dev_class, NULL, dev_rdma, NULL, "fastswap_perf_rdma_device"))) {
+        pr_err("Cannot create the Device 1\n");
+        goto remove_class;
+    }
+
+    atomic_long_set(&total_num_reads_async, 0L);
+    atomic_long_set(&total_time_ops, 0L);
+    atomic_long_set(&total_time_ops, 0L);
+    atomic_long_set(&total_time_reads_async, 0L);
+
+    pr_info("Char device successfully installed\n");
+
+    return 0;
+
+remove_class:
+    class_destroy(dev_class);
+remove_device_region:
+    unregister_chrdev_region(dev_rdma, 1);
+
+    return -1;
+}
+
 static int __init sswap_rdma_init_module(void)
 {
   int ret;
@@ -843,6 +980,10 @@ static int __init sswap_rdma_init_module(void)
   }
 
   pr_info("ctrl is ready for reqs\n");
+
+  if(perf_ioctl_init())
+    pr_err("failed to install char device");
+
   return 0;
 }
 

@@ -27,6 +27,7 @@ struct rdma_req {
   struct list_head list;
   struct ib_cqe cqe;
   u64 dma;
+  struct timespec rtt_start;
   struct page *page;
 };
 

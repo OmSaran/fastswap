@@ -20,9 +20,9 @@ struct perf_args {
 
 
 struct perf_args_rdma {
-    u64 count_sync;
+    u64 count_ops;
     u64 count_async;
-    u64 total_time_sync;
+    u64 total_time_ops;
     u64 total_time_async;
 };
 
